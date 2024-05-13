@@ -147,6 +147,7 @@ final public class ManagedDocuments {
       }
 
       // Commit changes to the PSI tree, but not to disk
+      VirtualFileManager.getInstance().syncRefresh();
       PsiDocumentManager.getInstance(project).commitDocument(doc);
 
       // Update the ground truth
@@ -174,7 +175,7 @@ final public class ManagedDocuments {
           if (doc == null)
             return; // todo handle
 
-          VirtualFileManager.getInstance().syncRefresh();
+          VirtualFileManager.getInstance().refreshWithoutFileWatcher(false);
           FileDocumentManager.getInstance().reloadFromDisk(doc);
           PsiDocumentManager.getInstance(project).commitAllDocuments();
         })));
