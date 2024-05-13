@@ -1,9 +1,10 @@
 package org.rri.ideals.server.codeactions;
 
 import com.google.gson.GsonBuilder;
+import com.intellij.codeInsight.daemon.impl.DaemonCodeAnalyzerImpl;
 import com.intellij.codeInsight.daemon.impl.HighlightInfo;
 import com.intellij.codeInsight.daemon.impl.ShowIntentionsPass;
-import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.Disposable;
 import com.intellij.openapi.application.ReadAction;
 import com.intellij.openapi.application.WriteAction;
 import com.intellij.openapi.command.CommandProcessor;
@@ -11,6 +12,7 @@ import com.intellij.openapi.command.WriteCommandAction;
 import com.intellij.openapi.components.Service;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.editor.Document;
+import com.intellij.openapi.editor.Editor;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.Disposer;
 import com.intellij.openapi.util.Ref;
@@ -21,17 +23,26 @@ import org.eclipse.lsp4j.CodeActionKind;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.WorkspaceEdit;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.rri.ideals.server.LspPath;
 import org.rri.ideals.server.diagnostics.DiagnosticsService;
-import org.rri.ideals.server.util.EditorUtil;
 import org.rri.ideals.server.util.MiscUtil;
 import org.rri.ideals.server.util.TextUtil;
 
 import java.util.*;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+
+import static com.intellij.codeInsight.daemon.impl.ShowIntentionsPass.*;
+import static com.intellij.openapi.application.ApplicationManager.getApplication;
+import static java.util.Collections.emptyList;
+import static java.util.Objects.requireNonNull;
+import static java.util.Optional.ofNullable;
+import static org.rri.ideals.server.util.EditorUtil.createEditor;
+import static org.rri.ideals.server.util.MiscUtil.resolvePsiFile;
 
 @Service(Service.Level.PROJECT)
 public final class CodeActionService {
@@ -63,37 +74,12 @@ public final class CodeActionService {
   @NotNull
   public List<CodeAction> getCodeActions(@NotNull LspPath path, @NotNull Range range) {
 
-    var result = new Ref<List<CodeAction>>();
-    ApplicationManager.getApplication().invokeAndWait(
-        () -> MiscUtil.invokeWithPsiFileInReadAction(project, path, (file) -> {
-          final var disposable = Disposer.newDisposable();
+    final List<CodeAction> actions = withEditorContext(path, range, context -> {
+      waitForUnresolvedQuickfix(context);
+      return availableCodeActions(context);
+    });
 
-          try {
-            EditorUtil.withEditor(disposable, file, range.getStart(), (editor) -> {
-              final var actionInfo = ShowIntentionsPass.getActionsToShow(editor, file, true);
-
-              final var quickFixes = diagnostics().getQuickFixes(path, range).stream()
-                  .map(it -> toCodeAction(path, range, it, CodeActionKind.QuickFix));
-
-              final var intentionActions = Stream.of(
-                      actionInfo.errorFixesToShow,
-                      actionInfo.inspectionFixesToShow,
-                      actionInfo.intentionsToShow)
-                  .flatMap(Collection::stream)
-                  .map(it -> toCodeAction(path, range, it, CodeActionKind.Refactor));
-
-              final var actions = Stream.concat(quickFixes, intentionActions)
-                  .filter(distinctByKey(CodeAction::getTitle))
-                  .collect(Collectors.toList());
-
-              result.set(actions);
-            });
-          } finally {
-            Disposer.dispose(disposable);
-          }
-        }));
-
-    return Optional.ofNullable(result.get()).orElse(Collections.emptyList());
+    return ofNullable(actions).orElse(emptyList());
   }
 
   @NotNull
@@ -107,7 +93,7 @@ public final class CodeActionService {
     var disposable = Disposer.newDisposable();
 
     try {
-      final var psiFile = MiscUtil.resolvePsiFile(project, path);
+      final var psiFile = resolvePsiFile(project, path);
 
       if (psiFile == null) {
         LOG.error("couldn't find PSI file: " + path);
@@ -116,11 +102,11 @@ public final class CodeActionService {
 
       final var oldCopy = ((PsiFile) psiFile.copy());
 
-      ApplicationManager.getApplication().invokeAndWait(() -> {
-        final var editor = EditorUtil.createEditor(disposable, psiFile, actionData.getRange().getStart());
+      getApplication().invokeAndWait(() -> {
+        final var editor = createEditor(disposable, psiFile, actionData.getRange().getStart());
 
         final var quickFixes = diagnostics().getQuickFixes(path, actionData.getRange());
-        final var actionInfo = ShowIntentionsPass.getActionsToShow(editor, psiFile, true);
+        final var actionInfo = getActionsToShow(editor, psiFile, true);
 
         var actionFound = Stream.of(
                 quickFixes,
@@ -151,8 +137,8 @@ public final class CodeActionService {
       final var newDoc = new Ref<Document>();
 
       ReadAction.run(() -> {
-        oldDoc.set(Objects.requireNonNull(MiscUtil.getDocument(oldCopy)));
-        newDoc.set(Objects.requireNonNull(MiscUtil.getDocument(psiFile)));
+        oldDoc.set(requireNonNull(MiscUtil.getDocument(oldCopy)));
+        newDoc.set(requireNonNull(MiscUtil.getDocument(psiFile)));
       });
 
       final var edits = TextUtil.textEditFromDocs(oldDoc.get(), newDoc.get());
@@ -167,7 +153,7 @@ public final class CodeActionService {
         result.setChanges(Map.of(actionData.getUri(), edits));
       }
     } finally {
-      ApplicationManager.getApplication().invokeAndWait(() -> Disposer.dispose(disposable));
+      getApplication().invokeAndWait(() -> Disposer.dispose(disposable));
     }
 
     diagnostics().launchDiagnostics(path);
@@ -179,4 +165,71 @@ public final class CodeActionService {
     return project.getService(DiagnosticsService.class);
   }
 
+  @SuppressWarnings("UnstableApiUsage")
+  private void waitForUnresolvedQuickfix(EditorContext context) {
+    DaemonCodeAnalyzerImpl.waitForUnresolvedReferencesQuickFixesUnderCaret(context.file(), context.editor());
+  }
+
+  @Nullable
+  private List<CodeAction> availableCodeActions(EditorContext context) {
+    return computeInEventDispatchThread(() -> {
+      final var path = context.path();
+      final var range = context.range();
+
+      final var actionInfo = ShowIntentionsPass.getActionsToShow(context.editor(), context.file(), true);
+
+      final var quickFixes = diagnostics().getQuickFixes(path, range).stream()
+              .map(it -> toCodeAction(path, range, it, CodeActionKind.QuickFix));
+
+      final var intentionActions = Stream.of(
+                      actionInfo.errorFixesToShow,
+                      actionInfo.inspectionFixesToShow,
+                      actionInfo.intentionsToShow)
+              .flatMap(Collection::stream)
+              .map(it -> toCodeAction(path, range, it, CodeActionKind.Refactor));
+
+      return Stream.concat(quickFixes, intentionActions)
+              .filter(distinctByKey(CodeAction::getTitle))
+              .collect(Collectors.toList());
+    });
+  }
+
+  @Nullable
+  private <T> T withEditorContext(@NotNull LspPath path, @NotNull Range range, Function<EditorContext, T> task) {
+    final Disposable disposable = Disposer.newDisposable();
+    T result;
+
+    try {
+      final EditorContext context = createContext(path, range, disposable);
+      result = task.apply(context);
+
+    } finally {
+      disposable.dispose();
+    }
+    return result;
+  }
+
+  @Nullable
+  private EditorContext createContext(@NotNull LspPath path, @NotNull Range range, @NotNull Disposable disposable) {
+    return computeInEventDispatchThread(() -> {
+      final PsiFile file = requireNonNull(resolvePsiFile(project, path));
+      final Editor editor = createEditor(disposable, file, range.getStart());
+      return new EditorContext(path, range, file, editor, disposable);
+    });
+  }
+
+  private record EditorContext(
+          LspPath path,
+          Range range,
+          PsiFile file,
+          Editor editor,
+          Disposable disposable
+  ) {}
+
+  @Nullable
+  private <T> T computeInEventDispatchThread(Supplier<T> supplier) {
+    Ref<T> result = new Ref<>();
+    getApplication().invokeAndWait(() -> result.set(supplier.get()));
+    return result.get();
+  }
 }
