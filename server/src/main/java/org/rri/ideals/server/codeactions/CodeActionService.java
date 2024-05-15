@@ -3,6 +3,7 @@ package org.rri.ideals.server.codeactions;
 import com.google.gson.GsonBuilder;
 import com.intellij.codeInsight.daemon.impl.HighlightInfo;
 import com.intellij.codeInsight.daemon.impl.ShowIntentionsPass;
+import com.intellij.codeInsight.intention.impl.ShowIntentionActionsHandler;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.application.ReadAction;
 import com.intellij.openapi.application.WriteAction;
@@ -11,6 +12,7 @@ import com.intellij.openapi.command.WriteCommandAction;
 import com.intellij.openapi.components.Service;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.editor.Document;
+import com.intellij.openapi.editor.Editor;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.Disposer;
 import com.intellij.openapi.util.Ref;
@@ -70,7 +72,7 @@ public final class CodeActionService {
 
           try {
             EditorUtil.withEditor(disposable, file, range.getStart(), (editor) -> {
-              final var actionInfo = ShowIntentionsPass.getActionsToShow(editor, file, true);
+              final var actionInfo = calcIntentions(editor, file);
 
               final var quickFixes = diagnostics().getQuickFixes(path, range).stream()
                   .map(it -> toCodeAction(path, range, it, CodeActionKind.QuickFix));
@@ -120,7 +122,7 @@ public final class CodeActionService {
         final var editor = EditorUtil.createEditor(disposable, psiFile, actionData.getRange().getStart());
 
         final var quickFixes = diagnostics().getQuickFixes(path, actionData.getRange());
-        final var actionInfo = ShowIntentionsPass.getActionsToShow(editor, psiFile, true);
+        final var actionInfo = calcIntentions(editor, psiFile);
 
         var actionFound = Stream.of(
                 quickFixes,
@@ -179,4 +181,8 @@ public final class CodeActionService {
     return project.getService(DiagnosticsService.class);
   }
 
+  @SuppressWarnings("UnstableApiUsage")
+  private ShowIntentionsPass.IntentionsInfo calcIntentions(Editor editor, PsiFile file) {
+    return ShowIntentionActionsHandler.calcIntentions(project, editor, file);
+  }
 }
